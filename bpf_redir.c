@@ -7,7 +7,7 @@
 #include "bpf_sockops.h"
 
 __section("sk_msg")
-int bpf_redir_proxy(struct sk_msg_md *msg)
+int bpf_redir(struct sk_msg_md *msg)
 {
 	__u64 flags = BPF_F_INGRESS;
 	struct sock_key key = {};
