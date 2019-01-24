@@ -9,8 +9,7 @@
 __section("sk_msg")
 int bpf_redir_proxy(struct sk_msg_md *msg)
 {
-	//__u64 flags = BPF_F_INGRESS;
-	__u64 flags = 0;
+	__u64 flags = BPF_F_INGRESS;
 	struct sock_key key = {};
 
 	sk_msg_extract4_key(msg, &key);
