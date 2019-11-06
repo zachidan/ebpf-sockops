@@ -1,21 +1,22 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
-#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/syscall.h>
-#include <netinet/in.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <netdb.h>
-#include <linux/aio_abi.h>
+#include <pthread.h>
 #include <errno.h>
 
 #define PROXY_PORT   10001
 #define SERVER_PORT  10000
+#define MAX_THREADS      8
+#define NUM_THREADS      4
+#define NUM_CONNS       32
+#define MAX_FDS        256
 
 #define TRUE             1
 #define FALSE            0
@@ -23,164 +24,337 @@
 #define SPLICE           0
 #define SPLICE_SIZE      512 * 1024
 
-#define AIO              1
+#define max(x,y) (x > y ? x : y)
 
-inline int io_setup(unsigned nr, aio_context_t *ctxp)
-{
-   return syscall(__NR_io_setup, nr, ctxp);
-}
- 
-inline int io_destroy(aio_context_t ctx) 
-{
-   return syscall(__NR_io_destroy, ctx);
-}
+int sig_pipes[2];
 
-inline int io_submit(aio_context_t ctx, long nr,  struct iocb **iocbpp) 
-{
-   return syscall(__NR_io_submit, ctx, nr, iocbpp);
-}
-
-#define AIO_RING_MAGIC 0xa10a10a1
-
-struct aio_ring {
-    unsigned id; /** kernel internal index number */
-    unsigned nr; /** number of io_events */
-    unsigned head;
-    unsigned tail;
-
-    unsigned magic;
-    unsigned compat_features;
-    unsigned incompat_features;
-    unsigned header_length; /** size of aio_ring */
-
-    struct io_event events[0];
+struct proxy_args {
+   int tid;
+   int ctrl_fd;
 };
 
-#ifdef __x86_64__
-#define read_barrier() __asm__ __volatile__("lfence" ::: "memory")
-#else
-#ifdef __i386__
-#define read_barrier() __asm__ __volatile__("" : : : "memory")
-#else
-#define read_barrier() __sync_synchronize()
-#endif
-#endif
-
-inline static int io_getevents(aio_context_t ctx, long min_nr, long max_nr,
-			       struct io_event *events,
-			       struct timespec *timeout)
+void *proxy_th(void *pargs_void_ptr)
 {
-	int i = 0;
+    int    tid, ctrl_fd, max_fd, end_thread, rc;
+    int    fd_map[MAX_FDS];
+#if SPLICE
+    int    pipes[2];
+#else
+    char   buffer[65536];
+#endif
+    fd_set master_set, working_set;
 
-	struct aio_ring *ring = (struct aio_ring *)ctx;
-	if (ring == NULL || ring->magic != AIO_RING_MAGIC) {
-		goto do_syscall;
-	}
+    struct proxy_args *pargs_ptr = (struct proxy_args *)pargs_void_ptr;
+    end_thread = FALSE;
+    tid = pargs_ptr->tid;
+    ctrl_fd = pargs_ptr->ctrl_fd;
+    memset(fd_map, 0, sizeof(fd_map));
+    FD_ZERO(&master_set);
+    max_fd = ctrl_fd;
+    FD_SET(ctrl_fd, &master_set);
 
-	while (i < max_nr) {
-		unsigned head = ring->head;
-		if (head == ring->tail) {
-			/* There are no more completions */
-			break;
-		} else {
-			/* There is another completion to reap */
-			events[i] = ring->events[head];
-			read_barrier();
-			ring->head = (head + 1) % ring->nr;
-			i++;
-		}
-	}
+    printf("Thread %d has been started\n", tid);
 
-	if (i == 0 && timeout != NULL && timeout->tv_sec == 0 &&
-	    timeout->tv_nsec == 0) {
-		/* Requested non blocking operation. */
-		return 0;
-	}
+#if SPLICE
+    printf("Splice is enabled - %d bytes\n", SPLICE_SIZE);
+    if (pipe(pipes) < 0) {
+       perror("   pipe() failed:");
+       return NULL;
+    }
+#endif
 
-	if (i && i >= min_nr) {
-		return i;
-	}
+    do
+    {
+      memcpy(&working_set, &master_set, sizeof(master_set));
+      rc = select(max_fd + 1, &working_set, NULL, NULL, NULL);
 
-do_syscall:
-	return syscall(__NR_io_getevents, ctx, min_nr - i, max_nr - i,
-		       &events[i], timeout);
+      /**********************************************************/
+      /* Check to see if the select call failed.                */
+      /**********************************************************/
+      if (rc < 0)
+      {
+         if (errno != EINTR)
+            perror("  select() failed:");
+         end_thread = TRUE;
+         break;
+      }
+
+      /**********************************************************/
+      /* Check to see if the time out expired.                  */
+      /**********************************************************/
+      if (rc == 0)
+      {
+         printf("  select() timed out.  End thread.\n");
+         end_thread = TRUE;
+         break;
+      }
+
+      /**********************************************************/
+      /* One or more descriptors are readable.  Need to         */
+      /* determine which ones they are.                         */
+      /**********************************************************/
+      int desc_ready = rc;
+      for (int i=0; i <= max_fd  &&  desc_ready > 0; ++i)
+      {
+         if (FD_ISSET(i, &working_set)) {
+            if (i == ctrl_fd) {
+               int fd1, fd2;
+               rc = read(ctrl_fd, &fd1, sizeof(fd1));
+               if (rc <= 0) {
+                  if (rc < 0)
+                     perror("   read() from control pipe failed:");
+                  end_thread = TRUE;
+                  break;
+               }
+
+               rc = read(ctrl_fd, &fd2, sizeof(int));
+               if (rc < 0) {
+                  perror("   read() from control pipe failed:");
+                  end_thread = TRUE;
+                  break;
+               }
+
+               if (fd1 >= MAX_FDS || fd2 >= MAX_FDS) {
+                  printf("   no more space in fd_map\n");
+                  end_thread = TRUE;
+                  break;
+               }
+
+               fd_map[fd1] = fd2;
+               fd_map[fd2] = fd1;
+               FD_SET(fd1, &master_set);
+               FD_SET(fd2, &master_set);
+               if (max_fd < fd1) {
+                  max_fd = fd1;
+               }
+               if (max_fd < fd2) {
+                  max_fd = fd2;
+               }
+            }
+            else
+            {
+               int close_conn = FALSE;
+               do {
+#if SPLICE
+                  /**********************************************/
+                  /* Forward the data to the remote server      */
+                  /**********************************************/
+                  rc = splice(i, NULL, pipes[1], NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+                  if (rc < 0)
+                  {
+                     if (errno != EAGAIN) {
+                        perror("  splice1 failed:");
+                        close_conn = TRUE;
+                     }
+                     break;
+                  }
+
+                  /**********************************************/
+                  /* Check to see if the connection has been    */
+                  /* closed by the client                       */
+                  /**********************************************/
+                  if (rc == 0)
+                  {
+                     printf("  Connection %d closed\n", i);
+                     close_conn = TRUE;
+                     break;
+                  }
+
+                  rc = splice(pipes[0], NULL, fd_map[i], NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+                  if (rc < 0)
+                  {
+                     perror("  splice2 failed:");
+                     close_conn = TRUE;
+                     break;
+                  }
+#else
+                  rc = recv(i, buffer, sizeof(buffer), 0);
+                  if (rc < 0)
+                  {
+                     if (errno != EWOULDBLOCK)
+                     {
+                        perror("  recv() failed:");
+                        close_conn = TRUE;
+                     }
+                     break;
+                  }
+
+                  /**********************************************/
+                  /* Check to see if the connection has been    */
+                  /* closed by the client                       */
+                  /**********************************************/
+                  if (rc == 0)
+                  {
+                     printf("  Connection %d closed\n", i);
+                     close_conn = TRUE;
+                     break;
+                  }
+
+                  int nbytes = rc;
+
+                  /**********************************************/
+                  /* Forward the data to the remote server      */
+                  /**********************************************/
+                  rc = send(fd_map[i], buffer, nbytes, 0);
+                  if (rc < 0)
+                  {
+                     perror("  send() failed:");
+                     close_conn = TRUE;
+                     break;
+                  }
+                  if (rc != nbytes)
+                     printf("*** Incomplete send %d %d \n", nbytes, rc);
+#endif
+               } while (close_conn == FALSE);
+
+               if (close_conn == TRUE) {
+                  close(i);
+                  close(fd_map[i]);
+                  FD_CLR(i, &master_set);
+                  FD_CLR(fd_map[i], &master_set); 
+                  fd_map[fd_map[i]] = 0;
+                  fd_map[i] = 0;
+               }
+            }
+         }
+      }
+   } while (end_thread == FALSE);
+
+   /*************************************************************/
+   /* Clean up all of the sockets that are open                 */
+   /*************************************************************/
+   for (int i=0; i <= max_fd; ++i)
+   {
+      if (FD_ISSET(i, &master_set))
+         close(i);
+   }
+
+   printf("Thread %d stopped\n", tid);
+   return NULL;
+}
+
+// Handler for SIGINT, caused by  Ctrl+C at keyboard
+void handle_sigint(int sig) 
+{
+   printf("Caught signal %d\n", sig); 
+   if (sig_pipes[1] != 0) {
+     close(sig_pipes[1]);
+   }
+}
+
+int open_conn(struct hostent *dest_he, int port) {
+   int sock, on=1;
+   struct sockaddr_in  proxy_addr;
+
+   if ((sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+      perror("socket:");
+      return -1;
+   }
+
+   proxy_addr.sin_family = AF_INET;           /* host byte order */
+   proxy_addr.sin_port = htons(port)    ;     /* short, network byte order */
+   proxy_addr.sin_addr = *((struct in_addr *)dest_he->h_addr);
+   memset(&(proxy_addr.sin_zero), 0, 8);      /* zero the rest of the struct */
+
+   if (connect(sock, (struct sockaddr *)&proxy_addr, sizeof(struct sockaddr)) == -1) {
+      perror("connect:");
+      close(sock);
+      return -1;
+   }
+
+   int rc = ioctl(sock, FIONBIO, (char *)&on);
+   if (rc < 0)
+   {
+      perror("ioctl() failed:");
+      close(sock);
+      return -1;
+   }
+
+   return sock;
 }
 
 int main (int argc, char *argv[])
 {
-   int    i, len, rc, on = 1, iter;
-   int    listen_sd, max_sd, new_sd, remote_sd;
+   int    i, rc, on = 1;
+   int    listen_sd, max_sd, new_sd, curr_thread=0;
    int    desc_ready, end_server = FALSE;
-   int    close_conn;
-#if SPLICE
-   int    pipes[2];
-#endif
-#if AIO
-   aio_context_t io_ctx;
-   struct iocb io_cb[2];
-   struct iocb *io_cbs[2];
-   struct io_event io_events[2];
-#endif
-   char   buffer[65536];
+   int    port_in = PROXY_PORT, port_out = SERVER_PORT, nthreads = NUM_THREADS, nconn=0;
+   int    tid_fd[MAX_THREADS], conns[NUM_CONNS];
+   char  *hostname;
    struct sockaddr_in6 addr;
-   struct sockaddr_in proxy_addr;
-   struct hostent *proxy_he;
-   struct timeval      timeout, start_t, end_t;
+   struct sockaddr_in  proxy_addr;
+   struct hostent     *proxy_he;
    fd_set              master_set, working_set;
-   int64_t numbytes;
+   pthread_t           tid[MAX_THREADS];
+   struct proxy_args   pargs[MAX_THREADS];
 
    if (argc < 2) {
-      perror("remote server hostname must be provided");
+      printf("remote server hostname must be provided\n");
+      exit(-1);
+   }
+   hostname = argv[1];
+
+   if (argc > 2) {
+      port_in = atoi(argv[2]);
+   }
+
+   if (argc > 3) {
+      port_out = atoi(argv[3]);
+   }
+
+   if (argc > 4) {
+      nthreads = atoi(argv[4]);
+      if (nthreads > MAX_THREADS) {
+         nthreads = MAX_THREADS;
+      }
+   }
+
+   if (pipe(sig_pipes) < 0) {
+      perror("pipe() failed:");
       exit(-1);
    }
 
+   signal(SIGINT, handle_sigint); 
+
    /*************************************************************/
-   /* Open a connection to the remote server                    */
+   /* Open NUM_CONNS connections to the remote server           */
    /*************************************************************/
    if ((proxy_he=gethostbyname(argv[1])) == NULL) {  /* get the host info */
-       perror("gethostbyname");
+       perror("gethostbyname failed:");
        exit(-1);
    }
 
-   if ((remote_sd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-      perror("socket");
-      exit(-1);
+   memset(conns, 0, sizeof(conns));
+   for (i=0; i < NUM_CONNS; i++) {
+      conns[i] = open_conn(proxy_he, port_out);
+      if (conns[i] == -1) {
+         exit(-1);
+      }
    }
 
-   proxy_addr.sin_family = AF_INET;           /* host byte order */
-   proxy_addr.sin_port = htons(SERVER_PORT);  /* short, network byte order */
-   proxy_addr.sin_addr = *((struct in_addr *)proxy_he->h_addr);
-   bzero(&(proxy_addr.sin_zero), 8);         /* zero the rest of the struct */
-
-   if (connect(remote_sd, (struct sockaddr *)&proxy_addr, sizeof(struct sockaddr)) == -1) {
-      perror("connect");
-      exit(-1);
-   }
-
-#if SPLICE
    /*************************************************************/
-   /* Open pipe for in-kernel copy                              */
+   /* Create worker threads                                     */
    /*************************************************************/
-   if (pipe(pipes) < 0)
-   {
-      perror("pipe:");
-      exit(-1);
-   }
-#endif
+   memset(&tid, 0, sizeof(tid));
+   memset(&tid_fd, 0, sizeof(tid_fd));
+   memset(&pargs, 0, sizeof(pargs));
 
-#if AIO
-   io_ctx = 0;
-   rc = io_setup(128, &io_ctx);
-   if (rc < 0) {
-      perror("io_setup error");
-      exit(-1);
-   }
+   int pipes[2];
+   for (i=0; i < nthreads; i++) {
+      if (pipe(pipes) < 0) {
+         perror("   pipe() failed:");
+         exit(-1);
+      }
 
-   /* setup I/O control block */
-   memset(io_cb, 0, sizeof(io_cb));
-   io_cbs[0] = &io_cb[0];
-   io_cbs[1] = &io_cb[1];
-#endif
+      tid_fd[i] = pipes[1];
+      pargs[i].tid = i;
+      pargs[i].ctrl_fd = pipes[0];
+      rc = pthread_create(&tid[i], NULL, proxy_th, (void *)&pargs[i]);
+      if (rc < 0) {
+         perror("   pthread_create() failed:");
+         exit(-1);
+      }
+   }
 
    /*************************************************************/
    /* Create an AF_INET6 stream socket to receive incoming      */
@@ -189,7 +363,7 @@ int main (int argc, char *argv[])
    listen_sd = socket(AF_INET6, SOCK_STREAM, 0);
    if (listen_sd < 0)
    {
-      perror("socket() failed");
+      perror("socket() failed:");
       exit(-1);
    }
 
@@ -200,7 +374,7 @@ int main (int argc, char *argv[])
                    (char *)&on, sizeof(on));
    if (rc < 0)
    {
-      perror("setsockopt() failed");
+      perror("setsockopt() failed:");
       close(listen_sd);
       exit(-1);
    }
@@ -213,7 +387,7 @@ int main (int argc, char *argv[])
    rc = ioctl(listen_sd, FIONBIO, (char *)&on);
    if (rc < 0)
    {
-      perror("ioctl() failed");
+      perror("ioctl() failed:");
       close(listen_sd);
       exit(-1);
    }
@@ -224,12 +398,12 @@ int main (int argc, char *argv[])
    memset(&addr, 0, sizeof(addr));
    addr.sin6_family      = AF_INET6;
    memcpy(&addr.sin6_addr, &in6addr_any, sizeof(in6addr_any));
-   addr.sin6_port        = htons(PROXY_PORT);
+   addr.sin6_port        = htons(port_in);
    rc = bind(listen_sd,
              (struct sockaddr *)&addr, sizeof(addr));
    if (rc < 0)
    {
-      perror("bind() failed");
+      perror("bind() failed:");
       close(listen_sd);
       exit(-1);
    }
@@ -240,7 +414,7 @@ int main (int argc, char *argv[])
    rc = listen(listen_sd, 32);
    if (rc < 0)
    {
-      perror("listen() failed");
+      perror("listen() failed:");
       close(listen_sd);
       exit(-1);
    }
@@ -249,15 +423,9 @@ int main (int argc, char *argv[])
    /* Initialize the master fd_set                              */
    /*************************************************************/
    FD_ZERO(&master_set);
-   max_sd = listen_sd;
+   max_sd = max(listen_sd, sig_pipes[0]);
    FD_SET(listen_sd, &master_set);
-
-   /*************************************************************/
-   /* Initialize the timeval struct to 3 minutes.  If no        */
-   /* activity after 3 minutes this program will end.           */
-   /*************************************************************/
-   timeout.tv_sec  = 3 * 60;
-   timeout.tv_usec = 0;
+   FD_SET(sig_pipes[0], &master_set);
 
    /*************************************************************/
    /* Loop waiting for incoming connects or for incoming data   */
@@ -271,26 +439,20 @@ int main (int argc, char *argv[])
       memcpy(&working_set, &master_set, sizeof(master_set));
 
       /**********************************************************/
-      /* Call select() and wait 3 minutes for it to complete.   */
+      /* Call select() and wait 5 minutes for it to complete.   */
       /**********************************************************/
       printf("Waiting on select()...\n");
-      rc = select(max_sd + 1, &working_set, NULL, NULL, &timeout);
+      rc = select(max_sd + 1, &working_set, NULL, NULL, NULL);
 
       /**********************************************************/
       /* Check to see if the select call failed.                */
       /**********************************************************/
       if (rc < 0)
       {
-         perror("  select() failed");
-         break;
-      }
-
-      /**********************************************************/
-      /* Check to see if the 3 minute time out expired.         */
-      /**********************************************************/
-      if (rc == 0)
-      {
-         printf("  select() timed out.  End program.\n");
+         if (errno != EINTR) {
+            perror("  select() failed:");
+         }
+         end_server = TRUE;
          break;
       }
 
@@ -340,21 +502,41 @@ int main (int argc, char *argv[])
                   {
                      if (errno != EWOULDBLOCK)
                      {
-                        perror("  accept() failed");
+                        perror("  accept() failed:");
                         end_server = TRUE;
                      }
                      break;
                   }
 
-                  /**********************************************/
-                  /* Add the new incoming connection to the     */
-                  /* master read set                            */
-                  /**********************************************/
                   printf("  New incoming connection - %d\n", new_sd);
-                  gettimeofday(&start_t, NULL);
-                  FD_SET(new_sd, &master_set);
-                  if (new_sd > max_sd)
-                     max_sd = new_sd;
+                  if (nconn >= NUM_CONNS) {
+                     printf("No more free upstream connections\n");
+                     close(new_sd);
+                     continue;
+                  }
+
+                  rc = ioctl(new_sd, FIONBIO, (char *)&on);
+                  if (rc < 0)
+                  {
+                     perror("   ioctl() failed:");
+                     close(new_sd);
+                     continue;
+                  }
+                  rc = write(tid_fd[curr_thread], &new_sd, sizeof(int));
+                  if (rc < 0) {
+                     perror("   write{} to pipe failed:");
+                     close(new_sd);
+                     continue;
+                  }
+                  rc = write(tid_fd[curr_thread], &conns[nconn], sizeof(int));
+                  if (rc < 0) {
+                     perror("   write() to pipe failed:");
+                     close(new_sd);
+                     continue;
+                  }
+
+                  curr_thread = (curr_thread + 1) % nthreads;
+                  nconn++;
 
                   /**********************************************/
                   /* Loop back up and accept another incoming   */
@@ -362,203 +544,27 @@ int main (int argc, char *argv[])
                   /**********************************************/
                } while (new_sd != -1);
             }
-
             /****************************************************/
-            /* This is not the listening socket, therefore an   */
-            /* existing connection must be readable             */
+            /* Check to see if this is the sig_pipes            */
             /****************************************************/
-            else
+            else if (i == sig_pipes[0])
             {
-               printf("  Descriptor %d is readable\n", i);
-               close_conn = FALSE;
-               /*************************************************/
-               /* Receive all incoming data on this socket      */
-               /* before we loop back and call select again.    */
-               /*************************************************/
-               do
-               {
-#if SPLICE
-                  /**********************************************/
-                  /* Forward the data to the remote server      */
-                  /**********************************************/
-                  rc = splice(i, NULL, pipes[1], NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_MORE | SPLICE_F_NONBLOCK );
-                  if (rc < 0)
-                  {
-                     if (errno != EAGAIN) {
-                        perror("  splice1 failed:");
-                        close_conn = TRUE;
-                     }
-                     break;
-                  }
-
-                  /**********************************************/
-                  /* Check to see if the connection has been    */
-                  /* closed by the client                       */
-                  /**********************************************/
-                  if (rc == 0)
-                  {
-                     printf("  Connection closed\n");
-                     close_conn = TRUE;
-                     break;
-                  }
-
-                  /**********************************************/
-                  /* Data was received                          */
-                  /**********************************************/
-                  len = rc;
-                  numbytes+=len;
-                  if (iter++ == 100) {
-                     gettimeofday(&end_t, NULL);
-
-                     int64_t tdiff_usec = ((end_t.tv_sec * 1000000 + end_t.tv_usec) - (start_t.tv_sec * 1000000 + start_t.tv_usec));
-                     float rate = (float)numbytes * 8 / tdiff_usec;
-                     printf("%d Mbit/sec\n", (int)rate);
-                     iter=0;
-                  }
-                  //printf("  %d bytes received\n", len);
-
-                  rc = splice(pipes[0], NULL, remote_sd, NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_MORE);
-                  if (rc < 0)
-                  {
-                     perror("  splice2 failed:");
-                     close_conn = TRUE;
-                     break;
-                  }
-#else
-
-#if AIO
-                  io_cb[0].aio_fildes = remote_sd;
-                  io_cb[0].aio_lio_opcode = IOCB_CMD_PWRITE;
-                  io_cb[0].aio_buf = (uint64_t)&buffer[0];
-                  io_cb[0].aio_nbytes = 0;
-
-                  io_cb[1].aio_fildes = i;
-                  io_cb[1].aio_lio_opcode = IOCB_CMD_PREAD;
-                  io_cb[1].aio_buf = (uint64_t)&buffer[0];
-                  io_cb[1].aio_nbytes = sizeof(buffer);
-
-                  do {
-                     rc = io_submit(io_ctx, 2, io_cbs);
-
-                     rc = io_getevents(io_ctx, 2, 2, io_events, NULL);
-                     if (rc != 2) {
-                        close_conn = TRUE;
-                        break;
-                     }
-                     if (io_events[1].res == 0) {
-                        close_conn = TRUE;
-                        break;
-                     }
-                     len = io_events[1].res;
-                     io_cb[0].aio_nbytes = len;
-                     numbytes+=len;
-                     if (iter++ == 10000) {
-                        gettimeofday(&end_t, NULL);
-
-                        int64_t tdiff_usec = ((end_t.tv_sec * 1000000 + end_t.tv_usec) - (start_t.tv_sec * 1000000 + start_t.tv_usec));
-                        float rate = (float)numbytes * 8 / tdiff_usec;
-                        printf("%d Mbit/sec\n", (int)rate);
-                        iter=0;
-                     }
-                  } while(TRUE);
-                  break;
-#else
-                  /**********************************************/
-                  /* Receive data on this connection until the  */
-                  /* recv fails with EWOULDBLOCK.  If any other */
-                  /* failure occurs, we will close the          */
-                  /* connection.                                */
-                  /**********************************************/
-                  rc = recv(i, buffer, sizeof(buffer), 0);
-                  if (rc < 0)
-                  {
-                     if (errno != EWOULDBLOCK)
-                     {
-                        perror("  recv() failed");
-                        close_conn = TRUE;
-                     }
-                     break;
-                  }
-
-                  /**********************************************/
-                  /* Check to see if the connection has been    */
-                  /* closed by the client                       */
-                  /**********************************************/
-                  if (rc == 0)
-                  {
-                     printf("  Connection closed\n");
-                     close_conn = TRUE;
-                     break;
-                  }
-
-                  /**********************************************/
-                  /* Data was received                          */
-                  /**********************************************/
-                  len = rc;
-                  numbytes+=len;
-                  if (iter++ == 100000) {
-                     gettimeofday(&end_t, NULL);
-                  
-                     int64_t tdiff_usec = ((end_t.tv_sec * 1000000 + end_t.tv_usec) - (start_t.tv_sec * 1000000 + start_t.tv_usec));
-                     float rate = (float)numbytes * 8 / tdiff_usec;
-                     printf("%d Mbit/sec\n", (int)rate);
-                     iter=0;
-                  }
-                  //printf("  %d bytes received\n", len);
-
-                  /**********************************************/
-                  /* Forward the data to the remote server      */
-                  /**********************************************/
-                  rc = send(remote_sd, buffer, len, 0);
-                  if (rc < 0)
-                  {
-                     perror("  send() failed");
-                     close_conn = TRUE;
-                     break;
-                  }
-#endif
-#endif
-
-               } while (TRUE);
-
-               /*************************************************/
-               /* If the close_conn flag was turned on, we need */
-               /* to clean up this active connection.  This     */
-               /* clean up process includes removing the        */
-               /* descriptor from the master set and            */
-               /* determining the new maximum descriptor value  */
-               /* based on the bits that are still turned on in */
-               /* the master set.                               */
-               /*************************************************/
-               if (close_conn)
-               {
-                  close(i);
-                  FD_CLR(i, &master_set);
-                  if (i == max_sd)
-                  {
-                     while (FD_ISSET(max_sd, &master_set) == FALSE)
-                        max_sd -= 1;
-                  }
-               }
-            } /* End of existing connection is readable */
+               end_server = TRUE;
+               break; 
+            }
          } /* End of if (FD_ISSET(i, &working_set)) */
       } /* End of loop through selectable descriptors */
 
    } while (end_server == FALSE);
 
-   /*************************************************************/
-   /* Clean up all of the sockets that are open                 */
-   /*************************************************************/
-   for (i=0; i <= max_sd; ++i)
-   {
-      if (FD_ISSET(i, &master_set))
-         close(i);
+   for (i=0; i < nthreads; i++) {
+      close(tid_fd[i]);
+   }
+   close(listen_sd);
+
+   for (i=0; i < nthreads; i++) {
+      pthread_join(tid[i], NULL);
    }
 
-   close(remote_sd);
-#if SPLICE
-   close(pipes[0]);
-   close(pipes[1]);
-#endif
    return 0;
 }
