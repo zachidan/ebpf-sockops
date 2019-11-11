@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <sys/epoll.h>
 #include <errno.h>
 
 #define PROXY_PORT   10001
@@ -22,7 +23,10 @@
 #define FALSE            0
 
 #define SPLICE           0
-#define SPLICE_SIZE      512 * 1024
+#define SPLICE_SIZE 262144
+
+#define EPOLL            0
+#define EPOLL_MAXEVENTS 64
 
 #define max(x,y) (x > y ? x : y)
 
@@ -35,36 +39,70 @@ struct proxy_args {
 
 void *proxy_th(void *pargs_void_ptr)
 {
-    int    tid, ctrl_fd, max_fd, end_thread, rc;
+    int    tid, ctrl_fd, ready_fd, end_thread, desc_ready, rc;
     int    fd_map[MAX_FDS];
 #if SPLICE
     int    pipes[2];
 #else
-    char   buffer[65536];
+    char   buffer[262 * 1024];
 #endif
+
+#if EPOLL
+    int epoll_fd;
+    struct epoll_event event, *events;
+#else
+    int max_fd;
     fd_set master_set, working_set;
+#endif
 
     struct proxy_args *pargs_ptr = (struct proxy_args *)pargs_void_ptr;
     end_thread = FALSE;
     tid = pargs_ptr->tid;
     ctrl_fd = pargs_ptr->ctrl_fd;
     memset(fd_map, 0, sizeof(fd_map));
+#if EPOLL
+    events = malloc(EPOLL_MAXEVENTS * sizeof(struct epoll_event));
+    if (events == NULL) {
+       perror("   malloc:");
+       return NULL;
+    }
+    memset(events, 0, EPOLL_MAXEVENTS * sizeof(event));
+
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+       perror("   epoll_create:");
+       return NULL;
+   }
+   event.events = EPOLLIN;
+   event.data.fd = ctrl_fd;
+
+   if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctrl_fd, &event))
+   {
+      perror("   epoll_ctl:");
+      close(epoll_fd);
+      return NULL;
+   }
+#else
     FD_ZERO(&master_set);
     max_fd = ctrl_fd;
     FD_SET(ctrl_fd, &master_set);
+#endif
 
     printf("Thread %d has been started\n", tid);
 
 #if SPLICE
     printf("Splice is enabled - %d bytes\n", SPLICE_SIZE);
     if (pipe(pipes) < 0) {
-       perror("   pipe() failed:");
+       perror("   pipe:");
        return NULL;
     }
 #endif
 
     do
     {
+#if EPOLL
+      desc_ready = epoll_wait(epoll_fd, events, EPOLL_MAXEVENTS, 100);
+#else
       memcpy(&working_set, &master_set, sizeof(master_set));
       rc = select(max_fd + 1, &working_set, NULL, NULL, NULL);
 
@@ -74,7 +112,7 @@ void *proxy_th(void *pargs_void_ptr)
       if (rc < 0)
       {
          if (errno != EINTR)
-            perror("  select() failed:");
+            perror("  select:");
          end_thread = TRUE;
          break;
       }
@@ -88,28 +126,43 @@ void *proxy_th(void *pargs_void_ptr)
          end_thread = TRUE;
          break;
       }
+#endif
 
       /**********************************************************/
       /* One or more descriptors are readable.  Need to         */
       /* determine which ones they are.                         */
       /**********************************************************/
-      int desc_ready = rc;
-      for (int i=0; i <= max_fd  &&  desc_ready > 0; ++i)
+#if EPOLL
+      for (int i=0; i < desc_ready; i++)
+      {
+         if (events[i].events & EPOLLHUP || events[i].events & EPOLLERR) {
+            end_thread = TRUE;
+            break;
+         }
+
+         if (events[i].events & EPOLLIN) {
+            ready_fd = events[i].data.fd;
+#else
+      desc_ready = rc;
+      for (int i=0; i <= max_fd && desc_ready > 0; ++i)
       {
          if (FD_ISSET(i, &working_set)) {
-            if (i == ctrl_fd) {
+            desc_ready--;
+            ready_fd = i;
+#endif
+            if (ready_fd == ctrl_fd) {
                int fd1, fd2;
                rc = read(ctrl_fd, &fd1, sizeof(fd1));
                if (rc <= 0) {
                   if (rc < 0)
-                     perror("   read() from control pipe failed:");
+                     perror("   read:");
                   end_thread = TRUE;
                   break;
                }
 
                rc = read(ctrl_fd, &fd2, sizeof(int));
                if (rc < 0) {
-                  perror("   read() from control pipe failed:");
+                  perror("   read:");
                   end_thread = TRUE;
                   break;
                }
@@ -122,6 +175,22 @@ void *proxy_th(void *pargs_void_ptr)
 
                fd_map[fd1] = fd2;
                fd_map[fd2] = fd1;
+#if EPOLL
+               event.data.fd = fd1;
+               event.events = EPOLLIN;
+               if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd1, &event) == -1) {
+                  perror("   epoll_ctl:");
+                  end_thread = TRUE;
+                  break;
+               }
+               event.data.fd = fd2;
+               event.events = EPOLLIN | EPOLLET;
+               if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd2, &event) == -1) {
+                  perror("   epoll_ctl:");
+                  end_thread = TRUE;
+                  break;
+               }
+#else
                FD_SET(fd1, &master_set);
                FD_SET(fd2, &master_set);
                if (max_fd < fd1) {
@@ -130,6 +199,7 @@ void *proxy_th(void *pargs_void_ptr)
                if (max_fd < fd2) {
                   max_fd = fd2;
                }
+#endif
             }
             else
             {
@@ -139,11 +209,11 @@ void *proxy_th(void *pargs_void_ptr)
                   /**********************************************/
                   /* Forward the data to the remote server      */
                   /**********************************************/
-                  rc = splice(i, NULL, pipes[1], NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+                  rc = splice(ready_fd, NULL, pipes[1], NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
                   if (rc < 0)
                   {
                      if (errno != EAGAIN) {
-                        perror("  splice1 failed:");
+                        perror("  splice1:");
                         close_conn = TRUE;
                      }
                      break;
@@ -155,25 +225,25 @@ void *proxy_th(void *pargs_void_ptr)
                   /**********************************************/
                   if (rc == 0)
                   {
-                     printf("  Connection %d closed\n", i);
+                     printf("  Connection %d closed\n", ready_fd);
                      close_conn = TRUE;
                      break;
                   }
 
-                  rc = splice(pipes[0], NULL, fd_map[i], NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+                  rc = splice(pipes[0], NULL, fd_map[ready_fd], NULL, SPLICE_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
                   if (rc < 0)
                   {
-                     perror("  splice2 failed:");
+                     perror("  splice2:");
                      close_conn = TRUE;
                      break;
                   }
 #else
-                  rc = recv(i, buffer, sizeof(buffer), 0);
+                  rc = recv(ready_fd, buffer, sizeof(buffer), MSG_DONTWAIT);
                   if (rc < 0)
                   {
                      if (errno != EWOULDBLOCK)
                      {
-                        perror("  recv() failed:");
+                        perror("  recv:");
                         close_conn = TRUE;
                      }
                      break;
@@ -185,7 +255,7 @@ void *proxy_th(void *pargs_void_ptr)
                   /**********************************************/
                   if (rc == 0)
                   {
-                     printf("  Connection %d closed\n", i);
+                     printf("  Connection %d closed\n", ready_fd);
                      close_conn = TRUE;
                      break;
                   }
@@ -195,25 +265,34 @@ void *proxy_th(void *pargs_void_ptr)
                   /**********************************************/
                   /* Forward the data to the remote server      */
                   /**********************************************/
-                  rc = send(fd_map[i], buffer, nbytes, 0);
+                  rc = send(fd_map[ready_fd], buffer, nbytes, MSG_DONTWAIT);
                   if (rc < 0)
                   {
-                     perror("  send() failed:");
+                     perror("  send:");
                      close_conn = TRUE;
                      break;
                   }
                   if (rc != nbytes)
-                     printf("*** Incomplete send %d %d \n", nbytes, rc);
+                     printf("Incomplete send %d < %d\n", rc, nbytes);
 #endif
                } while (close_conn == FALSE);
 
                if (close_conn == TRUE) {
-                  close(i);
-                  close(fd_map[i]);
-                  FD_CLR(i, &master_set);
-                  FD_CLR(fd_map[i], &master_set); 
-                  fd_map[fd_map[i]] = 0;
-                  fd_map[i] = 0;
+#if EPOLL
+                  if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ready_fd, NULL) == -1) {
+                     perror("   epoll_ctl:");
+                  }
+                  if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd_map[ready_fd], NULL) == -1) {
+                     perror("   epoll_ctl:");
+                  }
+#else
+                  FD_CLR(ready_fd, &master_set);
+                  FD_CLR(fd_map[ready_fd], &master_set); 
+#endif
+                  close(ready_fd);
+                  close(fd_map[ready_fd]);
+                  fd_map[fd_map[ready_fd]] = 0;
+                  fd_map[ready_fd] = 0;
                }
             }
          }
@@ -223,11 +302,13 @@ void *proxy_th(void *pargs_void_ptr)
    /*************************************************************/
    /* Clean up all of the sockets that are open                 */
    /*************************************************************/
+#if !EPOLL
    for (int i=0; i <= max_fd; ++i)
    {
       if (FD_ISSET(i, &master_set))
          close(i);
    }
+#endif
 
    printf("Thread %d stopped\n", tid);
    return NULL;
@@ -265,7 +346,7 @@ int open_conn(struct hostent *dest_he, int port) {
    int rc = ioctl(sock, FIONBIO, (char *)&on);
    if (rc < 0)
    {
-      perror("ioctl() failed:");
+      perror("ioctl:");
       close(sock);
       return -1;
    }
@@ -310,7 +391,7 @@ int main (int argc, char *argv[])
    }
 
    if (pipe(sig_pipes) < 0) {
-      perror("pipe() failed:");
+      perror("pipe:");
       exit(-1);
    }
 
@@ -320,7 +401,7 @@ int main (int argc, char *argv[])
    /* Open NUM_CONNS connections to the remote server           */
    /*************************************************************/
    if ((proxy_he=gethostbyname(argv[1])) == NULL) {  /* get the host info */
-       perror("gethostbyname failed:");
+       perror("gethostbyname:");
        exit(-1);
    }
 
@@ -342,7 +423,7 @@ int main (int argc, char *argv[])
    int pipes[2];
    for (i=0; i < nthreads; i++) {
       if (pipe(pipes) < 0) {
-         perror("   pipe() failed:");
+         perror("   pipe:");
          exit(-1);
       }
 
@@ -351,7 +432,7 @@ int main (int argc, char *argv[])
       pargs[i].ctrl_fd = pipes[0];
       rc = pthread_create(&tid[i], NULL, proxy_th, (void *)&pargs[i]);
       if (rc < 0) {
-         perror("   pthread_create() failed:");
+         perror("   pthread_create:");
          exit(-1);
       }
    }
@@ -363,7 +444,7 @@ int main (int argc, char *argv[])
    listen_sd = socket(AF_INET6, SOCK_STREAM, 0);
    if (listen_sd < 0)
    {
-      perror("socket() failed:");
+      perror("socket:");
       exit(-1);
    }
 
@@ -374,7 +455,7 @@ int main (int argc, char *argv[])
                    (char *)&on, sizeof(on));
    if (rc < 0)
    {
-      perror("setsockopt() failed:");
+      perror("setsockopt:");
       close(listen_sd);
       exit(-1);
    }
@@ -387,7 +468,7 @@ int main (int argc, char *argv[])
    rc = ioctl(listen_sd, FIONBIO, (char *)&on);
    if (rc < 0)
    {
-      perror("ioctl() failed:");
+      perror("ioctl:");
       close(listen_sd);
       exit(-1);
    }
@@ -403,7 +484,7 @@ int main (int argc, char *argv[])
              (struct sockaddr *)&addr, sizeof(addr));
    if (rc < 0)
    {
-      perror("bind() failed:");
+      perror("bind:");
       close(listen_sd);
       exit(-1);
    }
@@ -414,7 +495,7 @@ int main (int argc, char *argv[])
    rc = listen(listen_sd, 32);
    if (rc < 0)
    {
-      perror("listen() failed:");
+      perror("listen:");
       close(listen_sd);
       exit(-1);
    }
@@ -450,7 +531,7 @@ int main (int argc, char *argv[])
       if (rc < 0)
       {
          if (errno != EINTR) {
-            perror("  select() failed:");
+            perror("  select:");
          }
          end_server = TRUE;
          break;
@@ -502,7 +583,7 @@ int main (int argc, char *argv[])
                   {
                      if (errno != EWOULDBLOCK)
                      {
-                        perror("  accept() failed:");
+                        perror("  accept:");
                         end_server = TRUE;
                      }
                      break;
@@ -518,19 +599,19 @@ int main (int argc, char *argv[])
                   rc = ioctl(new_sd, FIONBIO, (char *)&on);
                   if (rc < 0)
                   {
-                     perror("   ioctl() failed:");
+                     perror("   ioctl:");
                      close(new_sd);
                      continue;
                   }
                   rc = write(tid_fd[curr_thread], &new_sd, sizeof(int));
                   if (rc < 0) {
-                     perror("   write{} to pipe failed:");
+                     perror("   write:");
                      close(new_sd);
                      continue;
                   }
                   rc = write(tid_fd[curr_thread], &conns[nconn], sizeof(int));
                   if (rc < 0) {
-                     perror("   write() to pipe failed:");
+                     perror("   write:");
                      close(new_sd);
                      continue;
                   }
