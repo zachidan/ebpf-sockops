@@ -8,8 +8,8 @@ static inline void bpf_sock_ops_ipv4(struct bpf_sock_ops *skops)
 {
 	struct sock_key key = {};
 	sk_extract4_key(skops, &key);
-	if (key.dip4 == 16777343 || key.sip4 == 16777343 ) {
-		if (key.dport == 4135 || key.sport == 4135) {
+	if (key.dip4 == loopback_ip || key.sip4 == loopback_ip ) {
+		if (key.dport == bpf_htons(SERVER_PORT) || key.sport == bpf_htons(SERVER_PORT)) {
 			int ret = sock_hash_update(skops, &sock_ops_map, &key, BPF_NOEXIST);
 			printk("<<< ipv4 op = %d, port %d --> %d\n", skops->op, key.sport, key.dport);
 			if (ret != 0)
