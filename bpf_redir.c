@@ -14,9 +14,9 @@ int bpf_redir(struct sk_msg_md *msg)
 
 	sk_msg_extract4_key(msg, &key);
 	// See whether the source or destination IP is local host
-	if (key.sip4 == 16777343 || key.dip4 == 16777343) {
+	if (key.dip4 == loopback_ip || key.sip4 == loopback_ip ) {
 		// See whether the source or destination port is 10000
-		if (key.sport == 4135 || key.dport == 4135) {
+		if (key.dport == bpf_htons(SERVER_PORT) || key.sport == bpf_htons(SERVER_PORT)) {
 			//int len1 = (__u64)msg->data_end - (__u64)msg->data;
 	                //printk("<<< redir_proxy port %d --> %d (%d)\n", key.sport, key.dport, len1);
 			msg_redirect_hash(msg, &sock_ops_map, &key, flags);

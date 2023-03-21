@@ -93,6 +93,11 @@ static void BPF_FUNC(trace_printk, const char *fmt, int fmt_size, ...);
     })
 #endif
 
+// 127.0.0.1
+static const __u32 loopback_ip = 127 + (1 << 24);
+#ifndef SERVER_PORT
+#define SERVER_PORT 10000
+#endif
 
 struct bpf_map_def {
 	__u32 type;
