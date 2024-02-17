@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <linux/types.h>
 #include <linux/swab.h>
+#include <bpf/bpf_helpers.h>
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 # define __bpf_ntohs(x)                 __builtin_bswap16(x)
@@ -93,15 +94,6 @@ static void BPF_FUNC(trace_printk, const char *fmt, int fmt_size, ...);
     })
 #endif
 
-
-struct bpf_map_def {
-	__u32 type;
-	__u32 key_size;
-	__u32 value_size;
-	__u32 max_entries;
-	__u32 map_flags;
-};
-
 union v6addr {
         struct {
                 __u32 p1;
@@ -138,13 +130,12 @@ struct sock_key {
 	__u32 dport;
 } __attribute__((packed));
 
-struct bpf_map_def __section_maps sock_ops_map = {
-	.type           = BPF_MAP_TYPE_SOCKHASH,
-	.key_size       = sizeof(struct sock_key),
-	.value_size     = sizeof(int),
-	.max_entries    = 65535,
-	.map_flags      = 0,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_SOCKHASH);
+    __uint(key_size, sizeof(struct sock_key));
+    __uint(value_size, sizeof(int));
+    __uint(max_entries, 65535);
+} sock_ops_map SEC(".maps");
 
 static inline void sk_extract4_key(struct bpf_sock_ops *ops,
 				   struct sock_key *key)
